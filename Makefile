@@ -18,10 +18,8 @@ build: ## Build Docker images
 	@echo "Building Docker images..."
 	docker-compose build
 
-up: ## Start all services
-	@echo "Starting services..."
-	docker-compose up -d postgres
-	@echo "✓ Postgres started"
+up: ## Start services (note: no background services needed with simplified architecture)
+	@echo "No background services to start with DuckDB-only architecture"
 	@echo "Run 'make run-once' to execute the pipeline"
 
 down: ## Stop all services
@@ -68,17 +66,16 @@ query: ## Run a quick query on the warehouse
 	@echo "Running sample queries..."
 	docker-compose run --rm pipeline python -c "import duckdb; conn = duckdb.connect('/data/warehouse.duckdb'); print('\n=== Top Customers ==='); print(conn.execute('SELECT customer_id, email, total_revenue FROM main_marts.customer_order_summary ORDER BY total_revenue DESC LIMIT 5').df()); conn.close()"
 
-generate-data: ## Generate sample data in Postgres
+generate-data: ## Generate sample data in DuckDB source tables
 	@echo "Generating sample data..."
 	docker-compose run --rm pipeline python /app/cdc_pipeline/data_generator.py
 
-extract-cdc: ## Extract CDC changes to DuckDB
+extract-cdc: ## Extract CDC changes from source tables to raw layer
 	@echo "Extracting CDC changes..."
 	docker-compose run --rm pipeline python /app/cdc_pipeline/cdc_extractor.py
 
 # Complete demo workflow
-demo: setup build up ## Run complete demo (setup, build, start services, run pipeline)
-	@sleep 5
+demo: setup build ## Run complete demo (setup, build, run pipeline)
 	@echo "Running complete demo..."
 	@make run-once
 	@echo "\n✓ Demo completed!"
@@ -86,5 +83,4 @@ demo: setup build up ## Run complete demo (setup, build, start services, run pip
 	@echo "  make query         - Run sample queries"
 	@echo "  make dbt-run       - Run DBT transformations"
 	@echo "  make run-once      - Run another pipeline iteration"
-	@echo "  make logs          - View logs"
-	@echo "  make down          - Stop services"
+	@echo "  make shell         - Open shell in container"

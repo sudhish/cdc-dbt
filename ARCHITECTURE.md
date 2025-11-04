@@ -2,36 +2,38 @@
 
 ## System Overview
 
-This DBT CDC Demo implements a modern ELT (Extract, Load, Transform) pipeline with Change Data Capture capabilities.
+This DBT CDC Demo implements a modern ELT (Extract, Load, Transform) pipeline with Change Data Capture capabilities using a simplified, single-database architecture with DuckDB.
 
 ## Data Flow
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                     SOURCE SYSTEM (Postgres)                    │
+│                   SOURCE SCHEMA (DuckDB)                        │
 ├─────────────────────────────────────────────────────────────────┤
-│  Tables:                                                        │
-│  ├── customers (customer_id PK, email, name, address...)       │
-│  ├── orders (order_id PK, customer_id FK, amount, status...)   │
-│  ├── order_items (order_item_id PK, order_id FK, product...)   │
+│  Schema: source                                                 │
+│  Tables (simulating external source system):                    │
+│  ├── cdc_customers (customer_id PK, email, name, address...)   │
+│  ├── cdc_orders (order_id PK, customer_id FK, amount...)       │
+│  ├── cdc_order_items (order_item_id PK, order_id FK...)        │
 │  └── cdc_metadata (tracking table)                             │
 └────────────────┬────────────────────────────────────────────────┘
                  │
                  │ 1. Data Generator (Faker)
-                 │    - Creates realistic sample data
-                 │    - Simulates INSERT/UPDATE/DELETE
+                 │    - Creates realistic sample data in source schema
+                 │    - Simulates INSERT/UPDATE operations
                  │
                  ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│              CDC EXTRACTOR (Python + Pandas)                    │
+│              CDC EXTRACTOR (Python + DuckDB)                    │
 ├─────────────────────────────────────────────────────────────────┤
 │  Process:                                                       │
 │  1. Query new records: WHERE id > last_extracted_id            │
+│     (from source.cdc_* tables)                                  │
 │  2. Add CDC metadata:                                           │
 │     - cdc_operation (INSERT/UPDATE/DELETE)                      │
 │     - cdc_timestamp                                             │
 │     - cdc_batch_id                                              │
-│  3. Load to DuckDB raw layer                                    │
+│  3. Load to raw layer (*_cdc tables)                            │
 │  4. Update high-water mark                                      │
 └────────────────┬────────────────────────────────────────────────┘
                  │
@@ -128,24 +130,24 @@ This DBT CDC Demo implements a modern ELT (Extract, Load, Transform) pipeline wi
 
 ### 2. CDC Extractor (`cdc_pipeline/cdc_extractor.py`)
 
-**Purpose**: Capture and land changes from Postgres to DuckDB
+**Purpose**: Capture and land changes from DuckDB source schema to raw layer
 
 **Pattern**: High-water mark CDC
 - Tracks last extracted ID per table
-- Queries: `SELECT * FROM table WHERE id > last_id`
-- Simple, reliable, no triggers needed
+- Queries: `SELECT * FROM source.cdc_table WHERE id > last_id`
+- Simple, reliable, all within DuckDB
 
 **Responsibilities**:
-- Extract new/updated records from Postgres
+- Extract new/updated records from source schema tables
 - Enrich with CDC metadata
 - Load to DuckDB raw layer
 - Update extraction metadata
 - Optional: Export to Parquet
 
 **Key Methods**:
-- `extract_table_changes()`: Query Postgres for new records
-- `load_to_duckdb()`: Insert into CDC tables
-- `export_to_parquet()`: Export for Iceberg compatibility
+- `extract_table_changes()`: Query source tables for new records
+- `load_to_duckdb()`: Insert into CDC tables in raw layer
+- `export_to_parquet()`: Export for external system compatibility
 
 **Metadata Tracked**:
 - `last_extracted_id`: High-water mark
@@ -215,13 +217,12 @@ WHERE rn = 1 AND cdc_operation != 'DELETE'
 
 **Workflow**:
 ```python
-1. wait_for_postgres()      # Ensure DB ready
-2. generate_data()           # Simulate source changes
-3. extract_cdc()             # Land to DuckDB
-4. dbt deps                  # Install DBT packages (first time)
-5. dbt run                   # Transform data
-6. dbt test                  # Validate quality
-7. show_results()            # Display metrics
+1. generate_data()           # Simulate source changes in source schema
+2. extract_cdc()             # Extract from source to raw layer
+3. dbt deps                  # Install DBT packages (first time)
+4. dbt run                   # Transform data
+5. dbt test                  # Validate quality
+6. show_results()            # Display metrics
 ```
 
 **Modes**:
@@ -355,16 +356,11 @@ catalog.create_table(
 
 ### Indexing Strategy
 
-**Postgres** (Source):
-```sql
-CREATE INDEX idx_customers_updated_at ON customers(updated_at);
-CREATE INDEX idx_customers_id ON customers(customer_id);
-```
-
-**DuckDB** (Warehouse):
+**DuckDB**:
 - DuckDB auto-indexes primary keys
 - Zone maps provide automatic min/max filtering
 - No explicit indexes needed for most queries
+- Columnar storage provides efficient scans
 
 ### Partitioning Strategy
 
@@ -454,39 +450,43 @@ WHERE s.customer_id IS NULL
 
 ## Deployment Architecture
 
-### Development
+### Development (Current Setup)
 ```
 Local Docker Compose
-├── Postgres (source)
-├── DuckDB (warehouse - local file)
+├── DuckDB (single file database)
+│   ├── source schema (simulated source)
+│   ├── raw schema (CDC landing)
+│   └── marts schema (DBT transforms)
 └── Pipeline (Python container)
 ```
 
 ### Production Considerations
 
+For production use with real source systems:
+
 ```
 ┌─────────────────┐
-│   Source DB     │ (RDS, Cloud SQL)
+│   Source DB     │ (PostgreSQL, MySQL, etc.)
 └────────┬────────┘
          │
          │ VPC/Private Network
          │
 ┌────────▼────────┐
-│ CDC Extractor   │ (ECS, Kubernetes)
-│  (Container)    │
+│ CDC Extractor   │ (ECS, Kubernetes, Airflow)
+│  (Container)    │ - Modified to connect to real source
 └────────┬────────┘
          │
          │ S3/GCS/Azure Blob
          │
 ┌────────▼────────┐
 │ DuckDB/Iceberg  │ (Data Lake)
-│  Parquet Files  │
+│  Parquet Files  │ Or: Snowflake, BigQuery, etc.
 └────────┬────────┘
          │
          │ DBT Cloud / Airflow
          │
 ┌────────▼────────┐
-│   Marts Layer   │ (Snowflake, BigQuery)
+│   Marts Layer   │ (Analytics-ready tables)
 └─────────────────┘
 ```
 

@@ -1,10 +1,9 @@
 """
-CDC Extractor to capture changes from Postgres and land them in DuckDB
+CDC Extractor to capture changes from DuckDB source tables and land them in DuckDB raw layer
 """
 import os
 from datetime import datetime
 from typing import Dict, List, Any
-import psycopg2
 import duckdb
 import pandas as pd
 from logging_config import get_logger, LogContext
@@ -14,30 +13,16 @@ logger = get_logger(__name__)
 
 
 class CDCExtractor:
-    """Extract CDC changes from Postgres and load into DuckDB"""
+    """Extract CDC changes from DuckDB source tables and load into DuckDB raw layer"""
 
-    def __init__(self, postgres_config: Dict[str, str], duckdb_path: str):
-        self.postgres_config = postgres_config
+    def __init__(self, duckdb_path: str):
         self.duckdb_path = duckdb_path
-        self.pg_conn = None
-        self.duck_conn = None
+        self.conn = None
 
     def connect(self):
-        """Establish connections to both databases"""
-        logger.info(f"Connecting to Postgres at {self.postgres_config['host']}:{self.postgres_config['port']}")
-        # Connect to Postgres
-        self.pg_conn = psycopg2.connect(
-            host=self.postgres_config['host'],
-            port=self.postgres_config['port'],
-            database=self.postgres_config['database'],
-            user=self.postgres_config['user'],
-            password=self.postgres_config['password']
-        )
-        logger.info("Connected to Postgres successfully")
-
-        # Connect to DuckDB
+        """Establish connection to DuckDB"""
         logger.info(f"Connecting to DuckDB at {self.duckdb_path}")
-        self.duck_conn = duckdb.connect(self.duckdb_path)
+        self.conn = duckdb.connect(self.duckdb_path)
         logger.info("Connected to DuckDB successfully")
 
         # Initialize DuckDB schemas and tables
@@ -46,16 +31,16 @@ class CDCExtractor:
     def _init_duckdb_schema(self):
         """Initialize DuckDB schema and CDC tables"""
         # Create schemas
-        self.duck_conn.execute("CREATE SCHEMA IF NOT EXISTS raw")
-        self.duck_conn.execute("CREATE SCHEMA IF NOT EXISTS staging")
-        self.duck_conn.execute("CREATE SCHEMA IF NOT EXISTS marts")
+        self.conn.execute("CREATE SCHEMA IF NOT EXISTS raw")
+        self.conn.execute("CREATE SCHEMA IF NOT EXISTS staging")
+        self.conn.execute("CREATE SCHEMA IF NOT EXISTS marts")
 
         # Create CDC tables with Iceberg-compatible structure
         # Note: DuckDB doesn't natively support Iceberg, but we'll structure data
         # in a way that's compatible with Iceberg table format (append-only with metadata)
 
         # Customers CDC table
-        self.duck_conn.execute("""
+        self.conn.execute("""
             CREATE TABLE IF NOT EXISTS raw.customers_cdc (
                 customer_id INTEGER,
                 email VARCHAR,
@@ -76,7 +61,7 @@ class CDCExtractor:
         """)
 
         # Orders CDC table
-        self.duck_conn.execute("""
+        self.conn.execute("""
             CREATE TABLE IF NOT EXISTS raw.orders_cdc (
                 order_id INTEGER,
                 customer_id INTEGER,
@@ -92,7 +77,7 @@ class CDCExtractor:
         """)
 
         # Order Items CDC table
-        self.duck_conn.execute("""
+        self.conn.execute("""
             CREATE TABLE IF NOT EXISTS raw.order_items_cdc (
                 order_item_id INTEGER,
                 order_id INTEGER,
@@ -108,7 +93,7 @@ class CDCExtractor:
         """)
 
         # CDC metadata table
-        self.duck_conn.execute("""
+        self.conn.execute("""
             CREATE TABLE IF NOT EXISTS raw.cdc_metadata (
                 table_name VARCHAR PRIMARY KEY,
                 last_extracted_id INTEGER,
@@ -119,7 +104,7 @@ class CDCExtractor:
 
         # Initialize metadata if not exists
         for table in ['customers', 'orders', 'order_items']:
-            self.duck_conn.execute(f"""
+            self.conn.execute(f"""
                 INSERT INTO raw.cdc_metadata (table_name, last_extracted_id, last_extracted_at, total_records_extracted)
                 SELECT '{table}', 0, CURRENT_TIMESTAMP, 0
                 WHERE NOT EXISTS (SELECT 1 FROM raw.cdc_metadata WHERE table_name = '{table}')
@@ -128,10 +113,9 @@ class CDCExtractor:
         logger.info("DuckDB schema and CDC tables initialized")
 
     def extract_table_changes(self, table_name: str, id_column: str) -> pd.DataFrame:
-        """Extract changes from a Postgres table using high-water mark"""
+        """Extract changes from DuckDB source table using high-water mark"""
         # Get last extracted ID
-        cursor = self.duck_conn.cursor()
-        result = cursor.execute(f"""
+        result = self.conn.execute(f"""
             SELECT last_extracted_id
             FROM raw.cdc_metadata
             WHERE table_name = '{table_name}'
@@ -140,28 +124,20 @@ class CDCExtractor:
         last_id = result[0] if result else 0
         logger.debug(f"Last extracted ID for {table_name}: {last_id}")
 
-        # Extract new/updated records from Postgres
-        pg_cursor = self.pg_conn.cursor()
-        pg_cursor.execute(f"""
+        # Extract new/updated records from source tables
+        source_table = f"source.cdc_{table_name}"
+        result = self.conn.execute(f"""
             SELECT *
-            FROM {table_name}
-            WHERE {id_column} > %s
+            FROM {source_table}
+            WHERE {id_column} > ?
             ORDER BY {id_column}
-        """, (last_id,))
+        """, (last_id,)).fetchdf()
 
-        # Get column names
-        columns = [desc[0] for desc in pg_cursor.description]
-
-        # Fetch all rows
-        rows = pg_cursor.fetchall()
-        pg_cursor.close()
-
-        if not rows:
+        if result.empty:
             logger.debug(f"No new records found for {table_name}")
             return pd.DataFrame()
 
-        # Create DataFrame
-        df = pd.DataFrame(rows, columns=columns)
+        df = result
 
         # Log details about extracted data
         min_id = df[id_column].min()
@@ -186,13 +162,13 @@ class CDCExtractor:
 
         try:
             # Use DuckDB's DataFrame INSERT
-            self.duck_conn.execute(f"INSERT INTO {target_table} SELECT * FROM df")
+            self.conn.execute(f"INSERT INTO {target_table} SELECT * FROM df")
 
             # Update metadata
             max_id = df[id_column].max()
             record_count = len(df)
 
-            self.duck_conn.execute(f"""
+            self.conn.execute(f"""
                 UPDATE raw.cdc_metadata
                 SET
                     last_extracted_id = {max_id},
@@ -216,7 +192,7 @@ class CDCExtractor:
         parquet_path = f"{output_dir}/{table_name}_cdc_{timestamp}.parquet"
 
         try:
-            self.duck_conn.execute(f"""
+            self.conn.execute(f"""
                 COPY (SELECT * FROM raw.{table_name}_cdc)
                 TO '{parquet_path}' (FORMAT PARQUET, COMPRESSION SNAPPY)
             """)
@@ -277,7 +253,7 @@ class CDCExtractor:
         logger.info("-" * 60)
 
         try:
-            result = self.duck_conn.execute("""
+            result = self.conn.execute("""
                 SELECT
                     table_name,
                     last_extracted_id,
@@ -294,28 +270,18 @@ class CDCExtractor:
             logger.error(f"Error displaying summary: {e}", exc_info=True)
 
     def close(self):
-        """Close database connections"""
-        if self.pg_conn:
-            self.pg_conn.close()
-        if self.duck_conn:
-            self.duck_conn.close()
+        """Close database connection"""
+        if self.conn:
+            self.conn.close()
 
 
 def main():
     """Main function to run CDC extraction"""
     import os
 
-    postgres_config = {
-        'host': os.getenv('POSTGRES_HOST', 'localhost'),
-        'port': os.getenv('POSTGRES_PORT', '5432'),
-        'database': os.getenv('POSTGRES_DB', 'source_db'),
-        'user': os.getenv('POSTGRES_USER', 'postgres'),
-        'password': os.getenv('POSTGRES_PASSWORD', 'postgres')
-    }
-
     duckdb_path = os.getenv('DUCKDB_PATH', '/data/warehouse.duckdb')
 
-    extractor = CDCExtractor(postgres_config, duckdb_path)
+    extractor = CDCExtractor(duckdb_path)
 
     try:
         logger.info("Starting CDC extraction process")

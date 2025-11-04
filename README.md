@@ -1,44 +1,53 @@
 # DBT CDC Demo Application
 
-A comprehensive demonstration of Change Data Capture (CDC) and Slowly Changing Dimensions (SCD) using DBT, Postgres, DuckDB, and Iceberg-compatible formats.
+A comprehensive demonstration of Change Data Capture (CDC) and Slowly Changing Dimensions (SCD) using DBT and DuckDB with a simplified, single-database architecture.
 
 ## Overview
 
 This project demonstrates a modern data pipeline that:
 
-- **Simulates CDC events** in a Postgres source database
+- **Simulates a source system** using DuckDB tables with `cdc_` prefix
+- **Generates realistic data** using Faker library
 - **Captures changes** using a high-water mark CDC pattern
-- **Lands data** in DuckDB with Iceberg-compatible structure (Parquet format)
+- **Lands data** in DuckDB raw layer with CDC metadata
 - **Transforms data** using DBT with SCD Type 2 dimensions
 - **Orchestrates** the entire pipeline using Python and Docker
 
 ## Architecture
 
 ```
-┌─────────────────┐
-│    Postgres     │  Source Database
-│  (Source Data)  │  - Customers
-│                 │  - Orders
-└────────┬────────┘  - Order Items
-         │
-         │ CDC Extraction
-         │ (Python)
-         ▼
-┌─────────────────┐
-│     DuckDB      │  Data Warehouse
-│   (Raw Layer)   │  - CDC Tables
-│                 │  - Parquet Files
-└────────┬────────┘
-         │
-         │ DBT Transformations
-         │
-         ▼
-┌─────────────────┐
-│  DBT Models     │
-│  - Staging      │  Latest state views
-│  - Marts        │  SCD Type 2 dimensions
-│                 │  Fact tables
-└─────────────────┘
+┌─────────────────────────────────────────┐
+│            DuckDB Database              │
+│                                         │
+│  ┌───────────────────────────────────┐ │
+│  │     Source Schema (cdc_*)         │ │
+│  │  Simulated Source System          │ │
+│  │  - cdc_customers                  │ │
+│  │  - cdc_orders                     │ │
+│  │  - cdc_order_items                │ │
+│  └──────────────┬────────────────────┘ │
+│                 │                       │
+│                 │ CDC Extraction        │
+│                 │ (High-water mark)     │
+│                 ▼                       │
+│  ┌───────────────────────────────────┐ │
+│  │     Raw Schema (*_cdc)            │ │
+│  │  CDC Landing Layer                │ │
+│  │  - customers_cdc                  │ │
+│  │  - orders_cdc                     │ │
+│  │  - order_items_cdc                │ │
+│  └──────────────┬────────────────────┘ │
+│                 │                       │
+│                 │ DBT Transformations   │
+│                 ▼                       │
+│  ┌───────────────────────────────────┐ │
+│  │  Staging & Marts                  │ │
+│  │  - stg_* (views)                  │ │
+│  │  - dim_customers_scd2 (table)     │ │
+│  │  - fact_orders (table)            │ │
+│  │  - customer_order_summary (table) │ │
+│  └───────────────────────────────────┘ │
+└─────────────────────────────────────────┘
 ```
 
 ## Features
@@ -66,8 +75,7 @@ This project demonstrates a modern data pipeline that:
 - **Python 3.11** - Pipeline orchestration
 - **UV** - Fast Python package manager
 - **DBT** - Data transformation framework
-- **Postgres 16** - Source database
-- **DuckDB** - Data warehouse
+- **DuckDB** - All-in-one database (source simulation + data warehouse)
 - **Docker** - Containerization
 - **Faker** - Realistic test data generation
 
@@ -260,16 +268,17 @@ customer_id | email           | city    | valid_from | valid_to   | is_current
 ### Data Model
 
 ```
-Source Tables (Postgres):
-- customers: Customer master data
-- orders: Order transactions
-- order_items: Order line items
-- cdc_metadata: Tracking table for CDC
+Source Schema (DuckDB - source.*):
+- source.cdc_customers: Simulated source customer data
+- source.cdc_orders: Simulated source order data
+- source.cdc_order_items: Simulated source order item data
+- source.cdc_metadata: CDC extraction tracking
 
-Raw Layer (DuckDB):
-- customers_cdc: All customer changes
-- orders_cdc: All order changes
-- order_items_cdc: All order item changes
+Raw Layer (DuckDB - raw.*):
+- raw.customers_cdc: All customer changes
+- raw.orders_cdc: All order changes
+- raw.order_items_cdc: All order item changes
+- raw.cdc_metadata: CDC metadata and watermarks
 
 Staging Layer (Views):
 - stg_customers: Latest customer state
@@ -289,20 +298,13 @@ Marts Layer (Tables):
 Edit `.env` file to configure:
 
 ```bash
-# Postgres
-POSTGRES_HOST=postgres
-POSTGRES_PORT=5432
-POSTGRES_DB=source_db
-POSTGRES_USER=postgres
-POSTGRES_PASSWORD=postgres
-
 # DuckDB
 DUCKDB_PATH=/data/warehouse.duckdb
 
 # Pipeline
-CDC_BATCH_SIZE=100
 CDC_POLL_INTERVAL=30
 PIPELINE_MODE=once  # or 'continuous'
+LOG_LEVEL=INFO
 ```
 
 ### DBT Configuration
@@ -386,16 +388,16 @@ WHERE o.order_date >= '2024-01-01'
 LIMIT 10;
 ```
 
-## Iceberg Integration
+## Parquet Export (Optional)
 
-While DuckDB doesn't natively support Apache Iceberg, this project uses Iceberg-compatible patterns:
+DuckDB data can be exported to Parquet format for interoperability:
 
 - **Parquet Format**: CDC data can be exported to Parquet
 - **Schema Evolution**: Tables support column additions
 - **Time Travel**: SCD Type 2 provides historical queries
-- **Partition Awareness**: Batch IDs enable partition pruning
+- **Batch IDs**: Enable partition-style filtering
 
-To export to Iceberg-compatible Parquet:
+To export to Parquet:
 
 ```python
 # In cdc_extractor.py
@@ -408,11 +410,12 @@ Files are saved to `/data/iceberg/` in Parquet format with Snappy compression.
 
 ### Adding New Tables
 
-1. Add table to Postgres schema in `sql_scripts/01_init_source.sql`
-2. Create CDC table in `cdc_extractor.py`
-3. Add extraction logic in `cdc_extractor.py`
-4. Create staging model in `dbt_project/models/staging/`
-5. Create marts model in `dbt_project/models/marts/`
+1. Add source table creation in `data_generator.py` (in `_init_source_tables()`)
+2. Add data generation logic in `data_generator.py`
+3. Create CDC table in `cdc_extractor.py` (in `_init_duckdb_schema()`)
+4. Add extraction logic in `cdc_extractor.py` (in `run_extraction()`)
+5. Create staging model in `dbt_project/models/staging/`
+6. Create marts model in `dbt_project/models/marts/`
 
 ### Customizing Data Generation
 
@@ -445,18 +448,6 @@ chmod 777 data
 
 See [TROUBLESHOOTING.md](TROUBLESHOOTING.md) for detailed troubleshooting steps.
 
-### Postgres Connection Issues
-```bash
-# Check if Postgres is running
-docker-compose ps
-
-# View Postgres logs
-docker-compose logs postgres
-
-# Restart Postgres
-docker-compose restart postgres
-```
-
 ### DuckDB Errors
 ```bash
 # Remove DuckDB file and start fresh
@@ -481,11 +472,10 @@ make demo
 
 ## Performance Considerations
 
-- **Batch Size**: Adjust `CDC_BATCH_SIZE` for larger datasets
 - **Polling Interval**: Tune `CDC_POLL_INTERVAL` based on data velocity
 - **DBT Threads**: Increase threads in `profiles.yml` for faster builds
-- **Indexes**: Add indexes in Postgres for large tables
-- **Partitioning**: Consider partitioning DuckDB tables by date
+- **DuckDB Memory**: DuckDB uses memory efficiently but can be configured
+- **Batch Processing**: The high-water mark pattern efficiently handles incremental loads
 
 ## Testing
 
