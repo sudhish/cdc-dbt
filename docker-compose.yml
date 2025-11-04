@@ -1,43 +1,17 @@
 services:
-  postgres:
-    image: postgres:16-alpine
-    container_name: dbt-cdc-postgres
-    environment:
-      POSTGRES_DB: source_db
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-    ports:
-      - "5432:5432"
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-      - ./sql_scripts:/docker-entrypoint-initdb.d
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-
   pipeline:
     build:
       context: .
       dockerfile: Dockerfile.pipeline
     container_name: dbt-cdc-pipeline
     user: "${DOCKER_UID:-1000}:${DOCKER_GID:-1000}"
-    depends_on:
-      postgres:
-        condition: service_healthy
     environment:
-      POSTGRES_HOST: postgres
-      POSTGRES_PORT: 5432
-      POSTGRES_DB: source_db
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
       DUCKDB_PATH: /data/warehouse.duckdb
+      PIPELINE_MODE: once
+      CDC_POLL_INTERVAL: 30
+      LOG_LEVEL: INFO
     volumes:
       - ./data:/data
       - ./dbt_project:/app/dbt_project
       - ./cdc_pipeline:/app/cdc_pipeline
     command: python /app/cdc_pipeline/orchestrator.py
-
-volumes:
-  postgres_data:

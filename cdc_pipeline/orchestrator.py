@@ -15,33 +15,6 @@ from logging_config import get_logger, LogContext, MetricsLogger
 logger = get_logger(__name__)
 
 
-def wait_for_postgres(db_config, max_retries=30):
-    """Wait for Postgres to be ready"""
-    import psycopg2
-
-    logger.info(f"Waiting for Postgres at {db_config['host']}:{db_config['port']}...")
-    for i in range(max_retries):
-        try:
-            conn = psycopg2.connect(
-                host=db_config['host'],
-                port=db_config['port'],
-                database=db_config['database'],
-                user=db_config['user'],
-                password=db_config['password']
-            )
-            conn.close()
-            logger.info("Postgres is ready and accepting connections")
-            return True
-        except psycopg2.OperationalError as e:
-            if i < max_retries - 1:
-                logger.debug(f"Postgres not ready, attempt {i+1}/{max_retries}: {e}")
-                time.sleep(2)
-            else:
-                logger.error("Postgres not available after maximum retries")
-                return False
-    return False
-
-
 def run_dbt_command(command: str, project_dir: str = "/app/dbt_project"):
     """Run a DBT command"""
     with LogContext(logger, f"DBT {command}"):
@@ -76,7 +49,7 @@ def run_dbt_command(command: str, project_dir: str = "/app/dbt_project"):
             return False
 
 
-def run_pipeline_once(db_config, duckdb_path):
+def run_pipeline_once(duckdb_path):
     """Run one iteration of the pipeline"""
     logger.info("="*60)
     logger.info(f"Pipeline Iteration Started - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -85,9 +58,9 @@ def run_pipeline_once(db_config, duckdb_path):
     metrics = MetricsLogger(logger)
     pipeline_start = datetime.now()
 
-    # Step 1: Generate/Update data in Postgres
-    logger.info("[Step 1/4] Generating data in Postgres...")
-    generator = DataGenerator(db_config)
+    # Step 1: Generate/Update data in DuckDB source tables
+    logger.info("[Step 1/4] Generating data in DuckDB source tables...")
+    generator = DataGenerator(duckdb_path)
     try:
         with LogContext(logger, "Data generation"):
             generator.connect()
@@ -132,9 +105,9 @@ def run_pipeline_once(db_config, duckdb_path):
     finally:
         generator.close()
 
-    # Step 2: Extract CDC changes to DuckDB
-    logger.info("[Step 2/4] Extracting CDC changes to DuckDB...")
-    extractor = CDCExtractor(db_config, duckdb_path)
+    # Step 2: Extract CDC changes from source tables to raw layer
+    logger.info("[Step 2/4] Extracting CDC changes from source tables to raw layer...")
+    extractor = CDCExtractor(duckdb_path)
     try:
         with LogContext(logger, "CDC extraction"):
             extractor.connect()
@@ -183,7 +156,7 @@ def run_pipeline_once(db_config, duckdb_path):
     return True
 
 
-def run_continuous_pipeline(db_config, duckdb_path, interval_seconds=30):
+def run_continuous_pipeline(duckdb_path, interval_seconds=30):
     """Run pipeline continuously with specified interval"""
     logger.info("="*60)
     logger.info("Starting Continuous CDC Pipeline")
@@ -199,7 +172,7 @@ def run_continuous_pipeline(db_config, duckdb_path, interval_seconds=30):
             iteration += 1
             logger.info(f"\n\nIteration #{iteration}")
 
-            success = run_pipeline_once(db_config, duckdb_path)
+            success = run_pipeline_once(duckdb_path)
 
             if not success:
                 failures += 1
@@ -284,27 +257,14 @@ def show_results(duckdb_path):
 def main():
     """Main entry point"""
     # Configuration
-    db_config = {
-        'host': os.getenv('POSTGRES_HOST', 'localhost'),
-        'port': os.getenv('POSTGRES_PORT', '5432'),
-        'database': os.getenv('POSTGRES_DB', 'source_db'),
-        'user': os.getenv('POSTGRES_USER', 'postgres'),
-        'password': os.getenv('POSTGRES_PASSWORD', 'postgres')
-    }
-
     duckdb_path = os.getenv('DUCKDB_PATH', '/data/warehouse.duckdb')
     mode = os.getenv('PIPELINE_MODE', 'once')  # 'once' or 'continuous'
     interval = int(os.getenv('CDC_POLL_INTERVAL', '30'))
 
-    logger.info("DBT CDC Pipeline Orchestrator")
+    logger.info("DBT CDC Pipeline Orchestrator (Simplified DuckDB-only Architecture)")
     logger.info(f"Mode: {mode}")
     logger.info(f"DuckDB Path: {duckdb_path}")
     logger.info(f"Log Level: {os.getenv('LOG_LEVEL', 'INFO')}")
-
-    # Wait for Postgres to be ready
-    if not wait_for_postgres(db_config):
-        logger.critical("Failed to connect to Postgres after all retries")
-        sys.exit(1)
 
     # Create data directory
     os.makedirs('/data', exist_ok=True)
@@ -312,10 +272,10 @@ def main():
 
     try:
         if mode == 'continuous':
-            run_continuous_pipeline(db_config, duckdb_path, interval)
+            run_continuous_pipeline(duckdb_path, interval)
         else:
             # Run once
-            run_pipeline_once(db_config, duckdb_path)
+            run_pipeline_once(duckdb_path)
 
             # Show results
             show_results(duckdb_path)

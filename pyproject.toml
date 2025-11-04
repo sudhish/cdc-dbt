@@ -1,17 +1,14 @@
 [project]
 name = "dbt-cdc-demo"
 version = "0.1.0"
-description = "DBT demo with CDC and SCD using Postgres, DuckDB, and Iceberg"
+description = "DBT demo with CDC and SCD using DuckDB with simulated source system"
 requires-python = ">=3.11"
 dependencies = [
     "dbt-duckdb>=1.8.0",
-    "psycopg2-binary>=2.9.9",
     "duckdb>=0.10.0",
     "pandas>=2.2.0",
-    "sqlalchemy>=2.0.25",
     "faker>=22.0.0",
     "python-dotenv>=1.0.0",
-    "pyiceberg>=0.6.0",
 ]
 
 [build-system]

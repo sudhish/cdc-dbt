@@ -1,11 +1,11 @@
 """
-Data generator to simulate CDC events in Postgres
+Data generator to simulate CDC events in DuckDB source tables
 """
 import random
 import time
 from datetime import datetime, timedelta
 from typing import List, Dict, Any
-import psycopg2
+import duckdb
 from faker import Faker
 from logging_config import get_logger
 
@@ -17,8 +17,8 @@ fake = Faker()
 class DataGenerator:
     """Generate realistic sample data for CDC simulation"""
 
-    def __init__(self, db_config: Dict[str, str]):
-        self.db_config = db_config
+    def __init__(self, duckdb_path: str):
+        self.duckdb_path = duckdb_path
         self.conn = None
         self.products = [
             "Laptop", "Mouse", "Keyboard", "Monitor", "Headphones",
@@ -29,16 +29,80 @@ class DataGenerator:
 
     def connect(self):
         """Establish database connection"""
-        logger.info(f"Connecting to Postgres at {self.db_config['host']}:{self.db_config['port']}")
-        self.conn = psycopg2.connect(
-            host=self.db_config['host'],
-            port=self.db_config['port'],
-            database=self.db_config['database'],
-            user=self.db_config['user'],
-            password=self.db_config['password']
-        )
-        self.conn.autocommit = True
-        logger.info("Connected to Postgres successfully")
+        logger.info(f"Connecting to DuckDB at {self.duckdb_path}")
+        self.conn = duckdb.connect(self.duckdb_path)
+        logger.info("Connected to DuckDB successfully")
+        self._init_source_tables()
+
+    def _init_source_tables(self):
+        """Initialize source tables with cdc_ prefix to simulate source system"""
+        logger.info("Initializing source tables...")
+
+        # Create source schema
+        self.conn.execute("CREATE SCHEMA IF NOT EXISTS source")
+
+        # Create cdc_customers table (simulated source system)
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS source.cdc_customers (
+                customer_id INTEGER PRIMARY KEY,
+                email VARCHAR(255) UNIQUE NOT NULL,
+                first_name VARCHAR(100),
+                last_name VARCHAR(100),
+                phone VARCHAR(50),
+                address TEXT,
+                city VARCHAR(100),
+                state VARCHAR(50),
+                zip_code VARCHAR(20),
+                country VARCHAR(100),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Create cdc_orders table
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS source.cdc_orders (
+                order_id INTEGER PRIMARY KEY,
+                customer_id INTEGER,
+                order_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                order_status VARCHAR(50),
+                total_amount DECIMAL(10, 2),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Create cdc_order_items table
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS source.cdc_order_items (
+                order_item_id INTEGER PRIMARY KEY,
+                order_id INTEGER,
+                product_name VARCHAR(255),
+                quantity INTEGER,
+                unit_price DECIMAL(10, 2),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Create CDC tracking metadata table
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS source.cdc_metadata (
+                table_name VARCHAR(100) PRIMARY KEY,
+                last_extracted_id INTEGER DEFAULT 0,
+                last_extracted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Initialize metadata
+        for table in ['customers', 'orders', 'order_items']:
+            self.conn.execute(f"""
+                INSERT INTO source.cdc_metadata (table_name, last_extracted_id)
+                SELECT '{table}', 0
+                WHERE NOT EXISTS (SELECT 1 FROM source.cdc_metadata WHERE table_name = '{table}')
+            """)
+
+        logger.info("Source tables initialized successfully")
 
     def close(self):
         """Close database connection"""
@@ -49,16 +113,20 @@ class DataGenerator:
         """Generate new customer records"""
         logger.info(f"Generating {count} new customers...")
         customer_ids = []
-        cursor = self.conn.cursor()
         errors = 0
 
-        for _ in range(count):
+        # Get the next customer_id
+        result = self.conn.execute("SELECT COALESCE(MAX(customer_id), 0) + 1 FROM source.cdc_customers").fetchone()
+        next_id = result[0]
+
+        for i in range(count):
             try:
-                cursor.execute("""
-                    INSERT INTO customers (email, first_name, last_name, phone, address, city, state, zip_code, country)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    RETURNING customer_id
+                customer_id = next_id + i
+                self.conn.execute("""
+                    INSERT INTO source.cdc_customers (customer_id, email, first_name, last_name, phone, address, city, state, zip_code, country)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
+                    customer_id,
                     fake.unique.email(),
                     fake.first_name(),
                     fake.last_name(),
@@ -69,14 +137,12 @@ class DataGenerator:
                     fake.zipcode(),
                     'USA'
                 ))
-                customer_id = cursor.fetchone()[0]
                 customer_ids.append(customer_id)
                 logger.debug(f"Created customer {customer_id}")
             except Exception as e:
                 errors += 1
                 logger.error(f"Error creating customer: {e}")
 
-        cursor.close()
         logger.info(f"Generated {len(customer_ids)} customers (errors: {errors})")
         return customer_ids
 
@@ -86,7 +152,6 @@ class DataGenerator:
             logger.debug("No customers to update")
             return
 
-        cursor = self.conn.cursor()
         update_count = min(count, len(customer_ids))
         selected_ids = random.sample(customer_ids, update_count)
 
@@ -100,10 +165,10 @@ class DataGenerator:
 
             try:
                 if update_type == 'address':
-                    cursor.execute("""
-                        UPDATE customers
-                        SET address = %s, city = %s, state = %s, zip_code = %s, updated_at = CURRENT_TIMESTAMP
-                        WHERE customer_id = %s
+                    self.conn.execute("""
+                        UPDATE source.cdc_customers
+                        SET address = ?, city = ?, state = ?, zip_code = ?, updated_at = CURRENT_TIMESTAMP
+                        WHERE customer_id = ?
                     """, (
                         fake.street_address(),
                         fake.city(),
@@ -112,16 +177,16 @@ class DataGenerator:
                         customer_id
                     ))
                 elif update_type == 'phone':
-                    cursor.execute("""
-                        UPDATE customers
-                        SET phone = %s, updated_at = CURRENT_TIMESTAMP
-                        WHERE customer_id = %s
+                    self.conn.execute("""
+                        UPDATE source.cdc_customers
+                        SET phone = ?, updated_at = CURRENT_TIMESTAMP
+                        WHERE customer_id = ?
                     """, (fake.phone_number(), customer_id))
                 else:  # email
-                    cursor.execute("""
-                        UPDATE customers
-                        SET email = %s, updated_at = CURRENT_TIMESTAMP
-                        WHERE customer_id = %s
+                    self.conn.execute("""
+                        UPDATE source.cdc_customers
+                        SET email = ?, updated_at = CURRENT_TIMESTAMP
+                        WHERE customer_id = ?
                     """, (fake.unique.email(), customer_id))
 
                 logger.debug(f"Updated customer {customer_id} ({update_type})")
@@ -130,7 +195,6 @@ class DataGenerator:
                 errors += 1
                 logger.error(f"Error updating customer {customer_id}: {e}")
 
-        cursor.close()
         logger.info(f"Updated {updated} customers (errors: {errors})")
 
     def generate_orders(self, customer_ids: List[int], count: int = 20) -> List[int]:
@@ -141,29 +205,30 @@ class DataGenerator:
 
         logger.info(f"Generating {count} new orders...")
         order_ids = []
-        cursor = self.conn.cursor()
         errors = 0
 
-        for _ in range(count):
+        # Get the next order_id
+        result = self.conn.execute("SELECT COALESCE(MAX(order_id), 0) + 1 FROM source.cdc_orders").fetchone()
+        next_id = result[0]
+
+        for i in range(count):
             customer_id = random.choice(customer_ids)
             order_status = random.choice(self.order_statuses)
             total_amount = round(random.uniform(10.0, 1000.0), 2)
             order_date = datetime.now() - timedelta(days=random.randint(0, 90))
 
             try:
-                cursor.execute("""
-                    INSERT INTO orders (customer_id, order_date, order_status, total_amount)
-                    VALUES (%s, %s, %s, %s)
-                    RETURNING order_id
-                """, (customer_id, order_date, order_status, total_amount))
-                order_id = cursor.fetchone()[0]
+                order_id = next_id + i
+                self.conn.execute("""
+                    INSERT INTO source.cdc_orders (order_id, customer_id, order_date, order_status, total_amount)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (order_id, customer_id, order_date, order_status, total_amount))
                 order_ids.append(order_id)
                 logger.debug(f"Created order {order_id} for customer {customer_id} (${total_amount})")
             except Exception as e:
                 errors += 1
                 logger.error(f"Error creating order: {e}")
 
-        cursor.close()
         logger.info(f"Generated {len(order_ids)} orders (errors: {errors})")
         return order_ids
 
@@ -174,9 +239,12 @@ class DataGenerator:
             return
 
         logger.info(f"Generating order items for {len(order_ids)} orders...")
-        cursor = self.conn.cursor()
         total_items = 0
         errors = 0
+
+        # Get the next order_item_id
+        result = self.conn.execute("SELECT COALESCE(MAX(order_item_id), 0) + 1 FROM source.cdc_order_items").fetchone()
+        next_id = result[0]
 
         for order_id in order_ids:
             # Each order has 1-5 items
@@ -188,16 +256,16 @@ class DataGenerator:
                 unit_price = round(random.uniform(10.0, 500.0), 2)
 
                 try:
-                    cursor.execute("""
-                        INSERT INTO order_items (order_id, product_name, quantity, unit_price)
-                        VALUES (%s, %s, %s, %s)
-                    """, (order_id, product_name, quantity, unit_price))
+                    order_item_id = next_id + total_items
+                    self.conn.execute("""
+                        INSERT INTO source.cdc_order_items (order_item_id, order_id, product_name, quantity, unit_price)
+                        VALUES (?, ?, ?, ?, ?)
+                    """, (order_item_id, order_id, product_name, quantity, unit_price))
                     total_items += 1
                 except Exception as e:
                     errors += 1
                     logger.error(f"Error creating order item: {e}")
 
-        cursor.close()
         logger.info(f"Generated {total_items} order items (errors: {errors})")
 
     def update_order_status(self, order_ids: List[int], count: int = 10):
@@ -206,7 +274,6 @@ class DataGenerator:
             logger.debug("No orders to update")
             return
 
-        cursor = self.conn.cursor()
         update_count = min(count, len(order_ids))
         selected_ids = random.sample(order_ids, update_count)
 
@@ -218,10 +285,10 @@ class DataGenerator:
             new_status = random.choice(self.order_statuses)
 
             try:
-                cursor.execute("""
-                    UPDATE orders
-                    SET order_status = %s, updated_at = CURRENT_TIMESTAMP
-                    WHERE order_id = %s
+                self.conn.execute("""
+                    UPDATE source.cdc_orders
+                    SET order_status = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE order_id = ?
                 """, (new_status, order_id))
                 logger.debug(f"Updated order {order_id} status to {new_status}")
                 updated += 1
@@ -229,23 +296,18 @@ class DataGenerator:
                 errors += 1
                 logger.error(f"Error updating order {order_id}: {e}")
 
-        cursor.close()
         logger.info(f"Updated {updated} order statuses (errors: {errors})")
 
     def get_all_customer_ids(self) -> List[int]:
         """Get all customer IDs from database"""
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT customer_id FROM customers")
-        customer_ids = [row[0] for row in cursor.fetchall()]
-        cursor.close()
+        result = self.conn.execute("SELECT customer_id FROM source.cdc_customers").fetchall()
+        customer_ids = [row[0] for row in result]
         return customer_ids
 
     def get_all_order_ids(self) -> List[int]:
         """Get all order IDs from database"""
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT order_id FROM orders")
-        order_ids = [row[0] for row in cursor.fetchall()]
-        cursor.close()
+        result = self.conn.execute("SELECT order_id FROM source.cdc_orders").fetchall()
+        order_ids = [row[0] for row in result]
         return order_ids
 
 
@@ -253,15 +315,9 @@ def main():
     """Main function to run data generation"""
     import os
 
-    db_config = {
-        'host': os.getenv('POSTGRES_HOST', 'localhost'),
-        'port': os.getenv('POSTGRES_PORT', '5432'),
-        'database': os.getenv('POSTGRES_DB', 'source_db'),
-        'user': os.getenv('POSTGRES_USER', 'postgres'),
-        'password': os.getenv('POSTGRES_PASSWORD', 'postgres')
-    }
+    duckdb_path = os.getenv('DUCKDB_PATH', '/data/warehouse.duckdb')
 
-    generator = DataGenerator(db_config)
+    generator = DataGenerator(duckdb_path)
 
     try:
         logger.info("Starting data generation process")
