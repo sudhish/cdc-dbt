@@ -84,8 +84,8 @@ This project demonstrates a modern data pipeline that:
 ```
 .
 ├── cdc_pipeline/              # CDC extraction pipeline
-│   ├── data_generator.py      # Generates sample data in Postgres
-│   ├── cdc_extractor.py       # Extracts changes to DuckDB
+│   ├── data_generator.py      # Generates sample data in DuckDB source tables
+│   ├── cdc_extractor.py       # Extracts changes from source to raw layer
 │   └── orchestrator.py        # Main pipeline orchestrator
 │
 ├── dbt_project/               # DBT project
@@ -100,9 +100,6 @@ This project demonstrates a modern data pipeline that:
 │   │       └── customer_order_summary.sql
 │   ├── dbt_project.yml
 │   └── profiles.yml
-│
-├── sql_scripts/               # Database initialization
-│   └── 01_init_source.sql
 │
 ├── docker-compose.yml         # Service orchestration
 ├── Dockerfile.pipeline        # Pipeline container
@@ -140,12 +137,11 @@ make demo
 
 This will:
 1. Build Docker images
-2. Start Postgres
-3. Initialize schema
-4. Generate sample data
-5. Extract CDC changes
-6. Run DBT transformations
-7. Show sample query results
+2. Initialize DuckDB with source tables
+3. Generate sample data
+4. Extract CDC changes
+5. Run DBT transformations
+6. Show sample query results
 
 ### 3. Explore Results
 
@@ -182,10 +178,10 @@ This runs the pipeline every 30 seconds (configurable via `CDC_POLL_INTERVAL`).
 ### Individual Components
 
 ```bash
-# Generate data in Postgres
+# Generate data in DuckDB source tables
 make generate-data
 
-# Extract CDC changes
+# Extract CDC changes from source to raw layer
 make extract-cdc
 
 # Run DBT models
@@ -211,9 +207,6 @@ make dbt-shell
 # Build images
 docker-compose build
 
-# Start services
-docker-compose up -d postgres
-
 # Run pipeline once
 docker-compose run --rm pipeline python /app/cdc_pipeline/orchestrator.py
 
@@ -223,7 +216,7 @@ docker-compose logs -f
 # Stop everything
 docker-compose down
 
-# Clean up volumes and data
+# Clean up data
 docker-compose down -v
 rm -rf data/
 ```
@@ -238,7 +231,7 @@ rm -rf data/
    - Simulates updates and status changes
 
 2. **Change Extraction**
-   - Queries Postgres for records with ID > last extracted ID
+   - Queries DuckDB source tables for records with ID > last extracted ID
    - Adds CDC metadata (operation type, timestamp, batch ID)
    - Loads to DuckDB raw layer
 

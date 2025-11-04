@@ -32,24 +32,6 @@ WARN[0000] the attribute `version` is obsolete
 
 This is just a warning and can be safely ignored. Docker Compose v2 no longer requires the version field.
 
-### Postgres Connection Issues
-
-```bash
-# Check if Postgres is running
-docker-compose ps
-
-# View Postgres logs
-docker-compose logs postgres
-
-# Restart Postgres
-docker-compose restart postgres
-
-# Wait longer for Postgres to be ready
-make up
-sleep 10
-make run-once
-```
-
 ### DuckDB Lock Errors
 
 If you see "database is locked" errors:
@@ -87,16 +69,6 @@ open -a Docker
 make demo
 ```
 
-**2. Port 5432 already in use:**
-```bash
-# Find what's using the port
-lsof -i :5432
-
-# Stop local Postgres if running
-brew services stop postgresql
-
-# Or change the port in docker-compose.yml
-```
 
 ### Import Errors
 
@@ -117,9 +89,8 @@ This usually means DBT is trying to run before the CDC extraction has completed.
 
 ```bash
 # Run steps individually:
-make up                  # Start Postgres
-make generate-data       # Generate source data
-make extract-cdc         # Extract to DuckDB
+make generate-data       # Generate source data in DuckDB
+make extract-cdc         # Extract from source to raw layer
 make dbt-run            # Run DBT models
 ```
 
@@ -139,8 +110,8 @@ make clean
 
 # This removes:
 # - All containers
-# - All volumes (including Postgres data)
-# - Local data/ directory
+# - All volumes
+# - Local data/ directory (including DuckDB file)
 
 # Start fresh
 make demo
@@ -154,14 +125,11 @@ make demo
 
 2. **Check logs:**
    ```bash
-   # All services
-   make logs
-
-   # Just Postgres
-   docker-compose logs postgres
-
    # Pipeline container
    docker-compose logs pipeline
+
+   # Or run directly to see output
+   docker-compose run --rm pipeline python /app/cdc_pipeline/orchestrator.py
    ```
 
 3. **Run with debug:**
@@ -182,7 +150,7 @@ make demo
 ### Quick Reset Commands
 
 ```bash
-# Soft reset (keep Postgres data)
+# Soft reset (remove DuckDB data)
 docker-compose down
 rm -rf data/
 make run-once
@@ -212,8 +180,7 @@ If you're still stuck:
 | Error | Meaning | Solution |
 |-------|---------|----------|
 | `permission denied` | File/directory permissions issue | `chmod 777 data/` |
-| `connection refused` | Postgres not ready | Wait longer or check `make logs` |
 | `database is locked` | Multiple DuckDB connections | Stop all containers, remove .duckdb files |
 | `relation does not exist` | DBT running before data loaded | Run extraction first |
-| `port already allocated` | Port 5432 in use | Stop local Postgres or change port |
 | `no such image` | Docker image not built | Run `make build` |
+| `import error` | Python dependencies missing | Rebuild container with `docker-compose build --no-cache` |
