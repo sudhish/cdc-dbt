@@ -122,7 +122,9 @@ class CDCExtractor:
         """).fetchone()
 
         last_id = result[0] if result else 0
-        logger.debug(f"Last extracted ID for {table_name}: {last_id}")
+
+        # Get total count in source table
+        source_count = self.conn.execute(f"SELECT COUNT(*) FROM source.cdc_{table_name}").fetchone()[0]
 
         # Extract new/updated records from source tables
         source_table = f"source.cdc_{table_name}"
@@ -134,15 +136,10 @@ class CDCExtractor:
         """, (last_id,)).fetchdf()
 
         if result.empty:
-            logger.debug(f"No new records found for {table_name}")
+            logger.debug(f"No new records in source.cdc_{table_name} (last processed ID: {last_id}, source has {source_count} total)")
             return pd.DataFrame()
 
         df = result
-
-        # Log details about extracted data
-        min_id = df[id_column].min()
-        max_id = df[id_column].max()
-        logger.info(f"Extracted {len(df)} new records from {table_name} (ID range: {min_id} to {max_id})")
 
         # Add CDC metadata
         df['cdc_operation'] = 'INSERT'  # Simplified: treating all as inserts
@@ -154,7 +151,6 @@ class CDCExtractor:
     def load_to_duckdb(self, df: pd.DataFrame, table_name: str, id_column: str):
         """Load CDC data to DuckDB"""
         if df.empty:
-            logger.debug(f"No new records to load for {table_name}")
             return
 
         # Insert into DuckDB CDC table
@@ -176,8 +172,6 @@ class CDCExtractor:
                     total_records_extracted = total_records_extracted + {record_count}
                 WHERE table_name = '{table_name}'
             """)
-
-            logger.info(f"Loaded {record_count} records to {target_table} (max ID: {max_id})")
 
         except Exception as e:
             logger.error(f"Error loading data to {target_table}: {e}", exc_info=True)
@@ -221,20 +215,29 @@ class CDCExtractor:
         }
 
         for table_name, id_column in tables:
-            logger.info(f"Extracting changes from {table_name}...")
             try:
                 with LogContext(logger, f"Extract and load {table_name}"):
+                    # Get count before extraction
+                    before_count = self.conn.execute(f"SELECT COUNT(*) FROM raw.{table_name}_cdc").fetchone()[0]
+
                     df = self.extract_table_changes(table_name, id_column)
+                    records_extracted = len(df) if not df.empty else 0
 
                     if not df.empty:
                         metrics['tables_with_changes'] += 1
-                        metrics['total_records_extracted'] += len(df)
-                        metrics[f'{table_name}_records'] = len(df)
+                        metrics['total_records_extracted'] += records_extracted
+                        metrics[f'{table_name}_records'] = records_extracted
 
                     self.load_to_duckdb(df, table_name, id_column)
 
-                    # Optionally export to Parquet for Iceberg
-                    # self.export_to_parquet(table_name)
+                    # Get count after extraction
+                    after_count = self.conn.execute(f"SELECT COUNT(*) FROM raw.{table_name}_cdc").fetchone()[0]
+
+                    # Log the extraction result
+                    if records_extracted > 0:
+                        logger.info(f"✓ {table_name}: Extracted {records_extracted} new records → raw.{table_name}_cdc (now has {after_count} total)")
+                    else:
+                        logger.info(f"○ {table_name}: No new records (raw.{table_name}_cdc has {after_count} total)")
 
                 metrics['tables_processed'] += 1
 
@@ -242,32 +245,14 @@ class CDCExtractor:
                 logger.error(f"Error extracting {table_name}: {e}", exc_info=True)
                 metrics['errors'] += 1
 
-        # Show extraction summary
-        self.show_summary()
+        # Log summary
+        if metrics['total_records_extracted'] > 0:
+            logger.info(f"CDC Extraction Complete: {metrics['total_records_extracted']} total new records extracted from {metrics['tables_with_changes']} table(s)")
+        else:
+            logger.info("CDC Extraction Complete: No new changes detected")
 
         return metrics
 
-    def show_summary(self):
-        """Display CDC extraction summary"""
-        logger.info("CDC Extraction Summary")
-        logger.info("-" * 60)
-
-        try:
-            result = self.conn.execute("""
-                SELECT
-                    table_name,
-                    last_extracted_id,
-                    last_extracted_at,
-                    total_records_extracted
-                FROM raw.cdc_metadata
-                ORDER BY table_name
-            """).fetchall()
-
-            for row in result:
-                logger.info(f"  {row[0]}: {row[3]} total records (last ID: {row[1]}, last extract: {row[2]})")
-
-        except Exception as e:
-            logger.error(f"Error displaying summary: {e}", exc_info=True)
 
     def close(self):
         """Close database connection"""

@@ -15,6 +15,48 @@ from logging_config import get_logger, LogContext, MetricsLogger
 logger = get_logger(__name__)
 
 
+def parse_dbt_output(output: str, command: str):
+    """Parse DBT output to extract useful information"""
+    import re
+
+    if command == "run":
+        # Extract model execution info
+        model_pattern = r'(\d+) of (\d+) (OK|ERROR) created (\w+) model (\w+\.)?(\w+)\s+\[(\w+) in ([\d.]+)s\]'
+        models_run = []
+
+        for line in output.split('\n'):
+            match = re.search(model_pattern, line)
+            if match:
+                status = match.group(3)
+                layer = match.group(5) if match.group(5) else ""
+                model = match.group(6)
+                result_type = match.group(7)
+                duration = match.group(8)
+
+                models_run.append({
+                    'status': status,
+                    'model': f"{layer}{model}",
+                    'result': result_type,
+                    'duration': duration
+                })
+
+        return models_run
+
+    elif command == "test":
+        # Extract test results
+        test_pattern = r'Completed (\d+) tests?, (\d+) passed, (\d+) (failed|warned)'
+        for line in output.split('\n'):
+            match = re.search(test_pattern, line)
+            if match:
+                return {
+                    'total': int(match.group(1)),
+                    'passed': int(match.group(2)),
+                    'failed': int(match.group(3))
+                }
+
+    return None
+
+
 def run_dbt_command(command: str, project_dir: str = "/app/dbt_project"):
     """Run a DBT command"""
     with LogContext(logger, f"DBT {command}"):
@@ -26,8 +68,22 @@ def run_dbt_command(command: str, project_dir: str = "/app/dbt_project"):
                 text=True
             )
 
-            # Log DBT output at debug level
+            # Parse and log DBT output
             if result.stdout:
+                parsed = parse_dbt_output(result.stdout, command)
+
+                if command == "run" and parsed:
+                    logger.info(f"DBT executed {len(parsed)} model(s):")
+                    for model in parsed:
+                        status_symbol = "✓" if model['status'] == "OK" else "✗"
+                        logger.info(f"  {status_symbol} {model['model']}: {model['result']} ({model['duration']}s)")
+
+                elif command == "test" and parsed:
+                    logger.info(f"DBT Tests: {parsed['passed']}/{parsed['total']} passed")
+                    if parsed['failed'] > 0:
+                        logger.warning(f"  {parsed['failed']} test(s) failed")
+
+                # Log full output at debug level
                 for line in result.stdout.split('\n'):
                     if line.strip():
                         logger.debug(f"DBT: {line}")
@@ -35,18 +91,60 @@ def run_dbt_command(command: str, project_dir: str = "/app/dbt_project"):
             if result.stderr:
                 for line in result.stderr.split('\n'):
                     if line.strip():
-                        logger.warning(f"DBT stderr: {line}")
+                        logger.debug(f"DBT stderr: {line}")
 
             if result.returncode == 0:
-                logger.info(f"DBT {command} completed successfully")
-                return True
+                return True, result.stdout
             else:
                 logger.error(f"DBT {command} failed with return code {result.returncode}")
-                return False
+                return False, result.stdout
 
         except Exception as e:
             logger.error(f"Error running DBT {command}: {e}", exc_info=True)
-            return False
+            return False, ""
+
+
+def show_table_counts(duckdb_path, stage: str):
+    """Show table counts at a specific stage"""
+    import duckdb
+    conn = duckdb.connect(duckdb_path, read_only=True)
+
+    try:
+        if stage == "source":
+            logger.info("Source Tables:")
+            tables = [
+                ("source.cdc_customers", "customers"),
+                ("source.cdc_orders", "orders"),
+                ("source.cdc_order_items", "order_items")
+            ]
+        elif stage == "raw":
+            logger.info("Raw Layer (CDC Tables):")
+            tables = [
+                ("raw.customers_cdc", "customers_cdc"),
+                ("raw.orders_cdc", "orders_cdc"),
+                ("raw.order_items_cdc", "order_items_cdc")
+            ]
+        elif stage == "marts":
+            logger.info("Marts Layer (Analytics Tables):")
+            tables = [
+                ("main_marts.customer_order_summary", "customer_order_summary"),
+                ("main_marts.dim_customers_scd2", "dim_customers_scd2"),
+                ("main_marts.fact_orders", "fact_orders")
+            ]
+        else:
+            return
+
+        for full_name, short_name in tables:
+            try:
+                count = conn.execute(f"SELECT COUNT(*) FROM {full_name}").fetchone()[0]
+                logger.info(f"  {short_name}: {count:,} records")
+            except Exception:
+                logger.info(f"  {short_name}: <not created yet>")
+
+    except Exception as e:
+        logger.debug(f"Error showing {stage} counts: {e}")
+    finally:
+        conn.close()
 
 
 def run_pipeline_once(duckdb_path):
@@ -54,6 +152,13 @@ def run_pipeline_once(duckdb_path):
     logger.info("="*60)
     logger.info(f"Pipeline Iteration Started - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info("="*60)
+    logger.info("")
+    logger.info("Data Flow:")
+    logger.info("  Step 1: Generate Data → source.cdc_* tables")
+    logger.info("  Step 2: Extract CDC → raw.*_cdc tables")
+    logger.info("  Step 3: DBT Transform → staging.* → marts.*")
+    logger.info("  Step 4: DBT Tests")
+    logger.info("")
 
     metrics = MetricsLogger(logger)
     pipeline_start = datetime.now()
@@ -102,6 +207,10 @@ def run_pipeline_once(duckdb_path):
                 metrics.record("orders_updated", 5)
 
             logger.info("Data generation complete")
+
+        # Show source table state
+        show_table_counts(duckdb_path, "source")
+
     finally:
         generator.close()
 
@@ -120,6 +229,9 @@ def run_pipeline_once(duckdb_path):
     finally:
         extractor.close()
 
+    # Show raw layer state after CDC extraction
+    show_table_counts(duckdb_path, "raw")
+
     # Step 3: Run DBT transformations
     logger.info("[Step 3/4] Running DBT transformations...")
 
@@ -129,17 +241,19 @@ def run_pipeline_once(duckdb_path):
         run_dbt_command("deps")
 
     # Run DBT models
-    success = run_dbt_command("run")
+    success, dbt_output = run_dbt_command("run")
 
     if success:
         logger.info("DBT transformations complete")
+        # Show marts layer state after DBT
+        show_table_counts(duckdb_path, "marts")
     else:
         logger.error("DBT transformations failed")
         return False
 
     # Step 4: Run DBT tests
     logger.info("[Step 4/4] Running DBT tests...")
-    test_success = run_dbt_command("test")
+    test_success, test_output = run_dbt_command("test")
     metrics.record("dbt_tests_passed", test_success)
 
     # Calculate total pipeline duration
