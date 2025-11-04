@@ -9,13 +9,17 @@ import subprocess
 from datetime import datetime
 from data_generator import DataGenerator
 from cdc_extractor import CDCExtractor
+from logging_config import get_logger, LogContext, MetricsLogger
+
+# Initialize logger
+logger = get_logger(__name__)
 
 
 def wait_for_postgres(db_config, max_retries=30):
     """Wait for Postgres to be ready"""
     import psycopg2
 
-    print("Waiting for Postgres to be ready...")
+    logger.info(f"Waiting for Postgres at {db_config['host']}:{db_config['port']}...")
     for i in range(max_retries):
         try:
             conn = psycopg2.connect(
@@ -26,205 +30,255 @@ def wait_for_postgres(db_config, max_retries=30):
                 password=db_config['password']
             )
             conn.close()
-            print("✓ Postgres is ready!")
+            logger.info("Postgres is ready and accepting connections")
             return True
-        except psycopg2.OperationalError:
+        except psycopg2.OperationalError as e:
             if i < max_retries - 1:
-                print(f"  Waiting... ({i+1}/{max_retries})")
+                logger.debug(f"Postgres not ready, attempt {i+1}/{max_retries}: {e}")
                 time.sleep(2)
             else:
-                print("✗ Postgres not available")
+                logger.error("Postgres not available after maximum retries")
                 return False
     return False
 
 
 def run_dbt_command(command: str, project_dir: str = "/app/dbt_project"):
     """Run a DBT command"""
-    print(f"\n=== Running DBT: {command} ===")
-    try:
-        result = subprocess.run(
-            f"cd {project_dir} && dbt {command} --profiles-dir .",
-            shell=True,
-            capture_output=True,
-            text=True
-        )
+    with LogContext(logger, f"DBT {command}"):
+        try:
+            result = subprocess.run(
+                f"cd {project_dir} && dbt {command} --profiles-dir .",
+                shell=True,
+                capture_output=True,
+                text=True
+            )
 
-        print(result.stdout)
-        if result.stderr:
-            print("Warnings/Errors:", result.stderr)
+            # Log DBT output at debug level
+            if result.stdout:
+                for line in result.stdout.split('\n'):
+                    if line.strip():
+                        logger.debug(f"DBT: {line}")
 
-        if result.returncode == 0:
-            print(f"✓ DBT {command} completed successfully")
-            return True
-        else:
-            print(f"✗ DBT {command} failed with return code {result.returncode}")
+            if result.stderr:
+                for line in result.stderr.split('\n'):
+                    if line.strip():
+                        logger.warning(f"DBT stderr: {line}")
+
+            if result.returncode == 0:
+                logger.info(f"DBT {command} completed successfully")
+                return True
+            else:
+                logger.error(f"DBT {command} failed with return code {result.returncode}")
+                return False
+
+        except Exception as e:
+            logger.error(f"Error running DBT {command}: {e}", exc_info=True)
             return False
-
-    except Exception as e:
-        print(f"✗ Error running DBT {command}: {e}")
-        return False
 
 
 def run_pipeline_once(db_config, duckdb_path):
     """Run one iteration of the pipeline"""
-    print("\n" + "="*60)
-    print(f"Pipeline Iteration - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("="*60)
+    logger.info("="*60)
+    logger.info(f"Pipeline Iteration Started - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info("="*60)
+
+    metrics = MetricsLogger(logger)
+    pipeline_start = datetime.now()
 
     # Step 1: Generate/Update data in Postgres
-    print("\n[1/4] Generating data in Postgres...")
+    logger.info("[Step 1/4] Generating data in Postgres...")
     generator = DataGenerator(db_config)
     try:
-        generator.connect()
+        with LogContext(logger, "Data generation"):
+            generator.connect()
 
-        # Get existing IDs
-        customer_ids = generator.get_all_customer_ids()
-        order_ids = generator.get_all_order_ids()
+            # Get existing IDs
+            customer_ids = generator.get_all_customer_ids()
+            order_ids = generator.get_all_order_ids()
 
-        if not customer_ids:
-            # Initial load
-            print("  Performing initial data load...")
-            customer_ids = generator.generate_customers(20)
-            order_ids = generator.generate_orders(customer_ids, 50)
-            generator.generate_order_items(order_ids)
-        else:
-            # Incremental updates
-            print("  Performing incremental updates...")
-            new_customers = generator.generate_customers(5)
-            customer_ids.extend(new_customers)
+            if not customer_ids:
+                # Initial load
+                logger.info("Performing initial data load...")
+                customer_ids = generator.generate_customers(20)
+                order_ids = generator.generate_orders(customer_ids, 50)
+                generator.generate_order_items(order_ids)
+                metrics.record("data_load_type", "initial")
+                metrics.record("new_customers", len(customer_ids))
+                metrics.record("new_orders", len(order_ids))
+            else:
+                # Incremental updates
+                logger.info(f"Performing incremental updates (existing: {len(customer_ids)} customers, {len(order_ids)} orders)...")
+                initial_customer_count = len(customer_ids)
+                initial_order_count = len(order_ids)
 
-            generator.update_customers(customer_ids, 3)
+                new_customers = generator.generate_customers(5)
+                customer_ids.extend(new_customers)
 
-            new_orders = generator.generate_orders(customer_ids, 10)
-            order_ids.extend(new_orders)
-            generator.generate_order_items(new_orders)
+                generator.update_customers(customer_ids, 3)
 
-            generator.update_order_status(order_ids, 5)
+                new_orders = generator.generate_orders(customer_ids, 10)
+                order_ids.extend(new_orders)
+                generator.generate_order_items(new_orders)
 
-        print("✓ Data generation complete")
+                generator.update_order_status(order_ids, 5)
+
+                metrics.record("data_load_type", "incremental")
+                metrics.record("new_customers", len(customer_ids) - initial_customer_count)
+                metrics.record("new_orders", len(order_ids) - initial_order_count)
+                metrics.record("customers_updated", 3)
+                metrics.record("orders_updated", 5)
+
+            logger.info("Data generation complete")
     finally:
         generator.close()
 
     # Step 2: Extract CDC changes to DuckDB
-    print("\n[2/4] Extracting CDC changes to DuckDB...")
+    logger.info("[Step 2/4] Extracting CDC changes to DuckDB...")
     extractor = CDCExtractor(db_config, duckdb_path)
     try:
-        extractor.connect()
-        extractor.run_extraction()
-        print("✓ CDC extraction complete")
+        with LogContext(logger, "CDC extraction"):
+            extractor.connect()
+            cdc_metrics = extractor.run_extraction()
+            # Merge CDC metrics into pipeline metrics
+            if cdc_metrics:
+                for key, value in cdc_metrics.items():
+                    metrics.record(f"cdc_{key}", value)
+            logger.info("CDC extraction complete")
     finally:
         extractor.close()
 
     # Step 3: Run DBT transformations
-    print("\n[3/4] Running DBT transformations...")
+    logger.info("[Step 3/4] Running DBT transformations...")
 
     # Install DBT packages (first time only)
     if not os.path.exists("/app/dbt_project/dbt_packages"):
+        logger.info("Installing DBT dependencies...")
         run_dbt_command("deps")
 
     # Run DBT models
     success = run_dbt_command("run")
 
     if success:
-        print("✓ DBT transformations complete")
+        logger.info("DBT transformations complete")
     else:
-        print("✗ DBT transformations failed")
+        logger.error("DBT transformations failed")
         return False
 
     # Step 4: Run DBT tests
-    print("\n[4/4] Running DBT tests...")
-    run_dbt_command("test")
+    logger.info("[Step 4/4] Running DBT tests...")
+    test_success = run_dbt_command("test")
+    metrics.record("dbt_tests_passed", test_success)
 
-    print("\n" + "="*60)
-    print("✓ Pipeline iteration complete!")
-    print("="*60)
+    # Calculate total pipeline duration
+    pipeline_duration = (datetime.now() - pipeline_start).total_seconds()
+    metrics.record("total_pipeline_duration_seconds", pipeline_duration)
+
+    # Log metrics summary
+    metrics.log_summary()
+
+    logger.info("="*60)
+    logger.info("Pipeline iteration complete!")
+    logger.info("="*60)
 
     return True
 
 
 def run_continuous_pipeline(db_config, duckdb_path, interval_seconds=30):
     """Run pipeline continuously with specified interval"""
-    print("\n" + "="*60)
-    print("Starting Continuous CDC Pipeline")
-    print("="*60)
-    print(f"Interval: {interval_seconds} seconds")
-    print("Press Ctrl+C to stop")
-    print("="*60)
+    logger.info("="*60)
+    logger.info("Starting Continuous CDC Pipeline")
+    logger.info("="*60)
+    logger.info(f"Interval: {interval_seconds} seconds")
+    logger.info("Press Ctrl+C to stop")
+    logger.info("="*60)
 
     iteration = 0
+    failures = 0
     try:
         while True:
             iteration += 1
-            print(f"\n\nIteration #{iteration}")
+            logger.info(f"\n\nIteration #{iteration}")
 
             success = run_pipeline_once(db_config, duckdb_path)
 
             if not success:
-                print("Pipeline iteration failed, but continuing...")
+                failures += 1
+                logger.warning(f"Pipeline iteration failed (total failures: {failures}), but continuing...")
+            else:
+                logger.info("Pipeline iteration succeeded")
 
-            print(f"\nWaiting {interval_seconds} seconds until next iteration...")
+            logger.info(f"Waiting {interval_seconds} seconds until next iteration...")
             time.sleep(interval_seconds)
 
     except KeyboardInterrupt:
-        print("\n\n✓ Pipeline stopped by user")
-        print(f"Total iterations completed: {iteration}")
+        logger.info("\n\nPipeline stopped by user")
+        logger.info(f"Total iterations completed: {iteration}")
+        logger.info(f"Successful iterations: {iteration - failures}")
+        logger.info(f"Failed iterations: {failures}")
 
 
 def show_results(duckdb_path):
     """Show some results from the data warehouse"""
     import duckdb
 
-    print("\n" + "="*60)
-    print("Sample Query Results")
-    print("="*60)
+    logger.info("="*60)
+    logger.info("Sample Query Results")
+    logger.info("="*60)
 
-    conn = duckdb.connect(duckdb_path)
+    try:
+        conn = duckdb.connect(duckdb_path)
 
-    # Show customer summary
-    print("\n--- Top 10 Customers by Revenue ---")
-    result = conn.execute("""
-        SELECT
-            customer_id,
-            email,
-            first_name || ' ' || last_name as name,
-            total_orders,
-            total_revenue,
-            avg_order_value
-        FROM main_marts.customer_order_summary
-        ORDER BY total_revenue DESC
-        LIMIT 10
-    """).fetchall()
+        # Show customer summary
+        logger.info("\n--- Top 10 Customers by Revenue ---")
+        result = conn.execute("""
+            SELECT
+                customer_id,
+                email,
+                first_name || ' ' || last_name as name,
+                total_orders,
+                total_revenue,
+                avg_order_value
+            FROM main_marts.customer_order_summary
+            ORDER BY total_revenue DESC
+            LIMIT 10
+        """).fetchall()
 
-    for row in result:
-        print(f"  {row[1]}: ${row[4]:.2f} ({row[3]} orders, avg ${row[5]:.2f})")
+        for row in result:
+            logger.info(f"  {row[1]}: ${row[4]:.2f} ({row[3]} orders, avg ${row[5]:.2f})")
 
-    # Show SCD2 example
-    print("\n--- Customers with History (SCD2) ---")
-    result = conn.execute("""
-        SELECT
-            customer_id,
-            email,
-            city,
-            state,
-            valid_from,
-            valid_to,
-            is_current
-        FROM main_marts.dim_customers_scd2
-        WHERE customer_id IN (
-            SELECT customer_id
+        # Show SCD2 example
+        logger.info("\n--- Customers with History (SCD2) ---")
+        result = conn.execute("""
+            SELECT
+                customer_id,
+                email,
+                city,
+                state,
+                valid_from,
+                valid_to,
+                is_current
             FROM main_marts.dim_customers_scd2
-            GROUP BY customer_id
-            HAVING COUNT(*) > 1
-        )
-        ORDER BY customer_id, valid_from
-        LIMIT 10
-    """).fetchall()
+            WHERE customer_id IN (
+                SELECT customer_id
+                FROM main_marts.dim_customers_scd2
+                GROUP BY customer_id
+                HAVING COUNT(*) > 1
+            )
+            ORDER BY customer_id, valid_from
+            LIMIT 10
+        """).fetchall()
 
-    for row in result:
-        current = "CURRENT" if row[6] else "EXPIRED"
-        print(f"  Customer {row[0]}: {row[2]}, {row[3]} [{current}]")
+        if result:
+            for row in result:
+                current = "CURRENT" if row[6] else "EXPIRED"
+                logger.info(f"  Customer {row[0]}: {row[2]}, {row[3]} [{current}]")
+        else:
+            logger.info("  No customer history changes found yet")
 
-    conn.close()
+        conn.close()
+
+    except Exception as e:
+        logger.error(f"Error showing results: {e}", exc_info=True)
 
 
 def main():
@@ -242,13 +296,19 @@ def main():
     mode = os.getenv('PIPELINE_MODE', 'once')  # 'once' or 'continuous'
     interval = int(os.getenv('CDC_POLL_INTERVAL', '30'))
 
+    logger.info("DBT CDC Pipeline Orchestrator")
+    logger.info(f"Mode: {mode}")
+    logger.info(f"DuckDB Path: {duckdb_path}")
+    logger.info(f"Log Level: {os.getenv('LOG_LEVEL', 'INFO')}")
+
     # Wait for Postgres to be ready
     if not wait_for_postgres(db_config):
-        print("✗ Failed to connect to Postgres")
+        logger.critical("Failed to connect to Postgres after all retries")
         sys.exit(1)
 
     # Create data directory
     os.makedirs('/data', exist_ok=True)
+    os.makedirs('/data/logs', exist_ok=True)
 
     try:
         if mode == 'continuous':
@@ -260,12 +320,10 @@ def main():
             # Show results
             show_results(duckdb_path)
 
-            print("\n✓ Pipeline completed successfully!")
+            logger.info("\nPipeline completed successfully!")
 
     except Exception as e:
-        print(f"\n✗ Pipeline failed: {e}")
-        import traceback
-        traceback.print_exc()
+        logger.critical(f"Pipeline failed with exception: {e}", exc_info=True)
         sys.exit(1)
 
 

@@ -7,7 +7,10 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Any
 import psycopg2
 from faker import Faker
+from logging_config import get_logger
 
+# Initialize logger
+logger = get_logger(__name__)
 fake = Faker()
 
 
@@ -26,6 +29,7 @@ class DataGenerator:
 
     def connect(self):
         """Establish database connection"""
+        logger.info(f"Connecting to Postgres at {self.db_config['host']}:{self.db_config['port']}")
         self.conn = psycopg2.connect(
             host=self.db_config['host'],
             port=self.db_config['port'],
@@ -34,6 +38,7 @@ class DataGenerator:
             password=self.db_config['password']
         )
         self.conn.autocommit = True
+        logger.info("Connected to Postgres successfully")
 
     def close(self):
         """Close database connection"""
@@ -42,8 +47,10 @@ class DataGenerator:
 
     def generate_customers(self, count: int = 10) -> List[int]:
         """Generate new customer records"""
+        logger.info(f"Generating {count} new customers...")
         customer_ids = []
         cursor = self.conn.cursor()
+        errors = 0
 
         for _ in range(count):
             try:
@@ -64,21 +71,28 @@ class DataGenerator:
                 ))
                 customer_id = cursor.fetchone()[0]
                 customer_ids.append(customer_id)
-                print(f"✓ Created customer {customer_id}")
+                logger.debug(f"Created customer {customer_id}")
             except Exception as e:
-                print(f"✗ Error creating customer: {e}")
+                errors += 1
+                logger.error(f"Error creating customer: {e}")
 
         cursor.close()
+        logger.info(f"Generated {len(customer_ids)} customers (errors: {errors})")
         return customer_ids
 
     def update_customers(self, customer_ids: List[int], count: int = 5):
         """Update existing customer records to simulate changes"""
         if not customer_ids:
+            logger.debug("No customers to update")
             return
 
         cursor = self.conn.cursor()
         update_count = min(count, len(customer_ids))
         selected_ids = random.sample(customer_ids, update_count)
+
+        logger.info(f"Updating {update_count} customers...")
+        updated = 0
+        errors = 0
 
         for customer_id in selected_ids:
             # Randomly choose what to update
@@ -110,19 +124,25 @@ class DataGenerator:
                         WHERE customer_id = %s
                     """, (fake.unique.email(), customer_id))
 
-                print(f"✓ Updated customer {customer_id} ({update_type})")
+                logger.debug(f"Updated customer {customer_id} ({update_type})")
+                updated += 1
             except Exception as e:
-                print(f"✗ Error updating customer {customer_id}: {e}")
+                errors += 1
+                logger.error(f"Error updating customer {customer_id}: {e}")
 
         cursor.close()
+        logger.info(f"Updated {updated} customers (errors: {errors})")
 
     def generate_orders(self, customer_ids: List[int], count: int = 20) -> List[int]:
         """Generate new order records"""
         if not customer_ids:
+            logger.debug("No customer IDs available to generate orders")
             return []
 
+        logger.info(f"Generating {count} new orders...")
         order_ids = []
         cursor = self.conn.cursor()
+        errors = 0
 
         for _ in range(count):
             customer_id = random.choice(customer_ids)
@@ -138,19 +158,25 @@ class DataGenerator:
                 """, (customer_id, order_date, order_status, total_amount))
                 order_id = cursor.fetchone()[0]
                 order_ids.append(order_id)
-                print(f"✓ Created order {order_id} for customer {customer_id}")
+                logger.debug(f"Created order {order_id} for customer {customer_id} (${total_amount})")
             except Exception as e:
-                print(f"✗ Error creating order: {e}")
+                errors += 1
+                logger.error(f"Error creating order: {e}")
 
         cursor.close()
+        logger.info(f"Generated {len(order_ids)} orders (errors: {errors})")
         return order_ids
 
     def generate_order_items(self, order_ids: List[int]):
         """Generate order items for orders"""
         if not order_ids:
+            logger.debug("No order IDs available to generate order items")
             return
 
+        logger.info(f"Generating order items for {len(order_ids)} orders...")
         cursor = self.conn.cursor()
+        total_items = 0
+        errors = 0
 
         for order_id in order_ids:
             # Each order has 1-5 items
@@ -166,20 +192,27 @@ class DataGenerator:
                         INSERT INTO order_items (order_id, product_name, quantity, unit_price)
                         VALUES (%s, %s, %s, %s)
                     """, (order_id, product_name, quantity, unit_price))
-                    print(f"✓ Created order item for order {order_id}")
+                    total_items += 1
                 except Exception as e:
-                    print(f"✗ Error creating order item: {e}")
+                    errors += 1
+                    logger.error(f"Error creating order item: {e}")
 
         cursor.close()
+        logger.info(f"Generated {total_items} order items (errors: {errors})")
 
     def update_order_status(self, order_ids: List[int], count: int = 10):
         """Update order statuses to simulate state changes"""
         if not order_ids:
+            logger.debug("No orders to update")
             return
 
         cursor = self.conn.cursor()
         update_count = min(count, len(order_ids))
         selected_ids = random.sample(order_ids, update_count)
+
+        logger.info(f"Updating status for {update_count} orders...")
+        updated = 0
+        errors = 0
 
         for order_id in selected_ids:
             new_status = random.choice(self.order_statuses)
@@ -190,11 +223,14 @@ class DataGenerator:
                     SET order_status = %s, updated_at = CURRENT_TIMESTAMP
                     WHERE order_id = %s
                 """, (new_status, order_id))
-                print(f"✓ Updated order {order_id} status to {new_status}")
+                logger.debug(f"Updated order {order_id} status to {new_status}")
+                updated += 1
             except Exception as e:
-                print(f"✗ Error updating order {order_id}: {e}")
+                errors += 1
+                logger.error(f"Error updating order {order_id}: {e}")
 
         cursor.close()
+        logger.info(f"Updated {updated} order statuses (errors: {errors})")
 
     def get_all_customer_ids(self) -> List[int]:
         """Get all customer IDs from database"""
@@ -228,20 +264,19 @@ def main():
     generator = DataGenerator(db_config)
 
     try:
-        print("Connecting to Postgres...")
+        logger.info("Starting data generation process")
         generator.connect()
-        print("✓ Connected to Postgres")
 
         # Initial data load
-        print("\n=== Generating initial data ===")
+        logger.info("=== Generating initial data ===")
         customer_ids = generator.generate_customers(20)
         order_ids = generator.generate_orders(customer_ids, 50)
         generator.generate_order_items(order_ids)
 
-        print("\n=== Simulating CDC changes ===")
+        logger.info("=== Simulating CDC changes ===")
         # Simulate ongoing changes
         for i in range(3):
-            print(f"\n--- Change batch {i+1} ---")
+            logger.info(f"--- Change batch {i+1} ---")
             time.sleep(2)
 
             # Add new customers
@@ -259,10 +294,10 @@ def main():
             # Update order statuses
             generator.update_order_status(order_ids, 5)
 
-        print("\n✓ Data generation completed successfully!")
+        logger.info("Data generation completed successfully!")
 
     except Exception as e:
-        print(f"\n✗ Error: {e}")
+        logger.critical(f"Data generation failed: {e}", exc_info=True)
     finally:
         generator.close()
 

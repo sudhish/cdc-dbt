@@ -7,6 +7,10 @@ from typing import Dict, List, Any
 import psycopg2
 import duckdb
 import pandas as pd
+from logging_config import get_logger, LogContext
+
+# Initialize logger
+logger = get_logger(__name__)
 
 
 class CDCExtractor:
@@ -20,6 +24,7 @@ class CDCExtractor:
 
     def connect(self):
         """Establish connections to both databases"""
+        logger.info(f"Connecting to Postgres at {self.postgres_config['host']}:{self.postgres_config['port']}")
         # Connect to Postgres
         self.pg_conn = psycopg2.connect(
             host=self.postgres_config['host'],
@@ -28,9 +33,12 @@ class CDCExtractor:
             user=self.postgres_config['user'],
             password=self.postgres_config['password']
         )
+        logger.info("Connected to Postgres successfully")
 
         # Connect to DuckDB
+        logger.info(f"Connecting to DuckDB at {self.duckdb_path}")
         self.duck_conn = duckdb.connect(self.duckdb_path)
+        logger.info("Connected to DuckDB successfully")
 
         # Initialize DuckDB schemas and tables
         self._init_duckdb_schema()
@@ -117,7 +125,7 @@ class CDCExtractor:
                 WHERE NOT EXISTS (SELECT 1 FROM raw.cdc_metadata WHERE table_name = '{table}')
             """)
 
-        print("✓ DuckDB schema initialized")
+        logger.info("DuckDB schema and CDC tables initialized")
 
     def extract_table_changes(self, table_name: str, id_column: str) -> pd.DataFrame:
         """Extract changes from a Postgres table using high-water mark"""
@@ -130,6 +138,7 @@ class CDCExtractor:
         """).fetchone()
 
         last_id = result[0] if result else 0
+        logger.debug(f"Last extracted ID for {table_name}: {last_id}")
 
         # Extract new/updated records from Postgres
         pg_cursor = self.pg_conn.cursor()
@@ -148,10 +157,16 @@ class CDCExtractor:
         pg_cursor.close()
 
         if not rows:
+            logger.debug(f"No new records found for {table_name}")
             return pd.DataFrame()
 
         # Create DataFrame
         df = pd.DataFrame(rows, columns=columns)
+
+        # Log details about extracted data
+        min_id = df[id_column].min()
+        max_id = df[id_column].max()
+        logger.info(f"Extracted {len(df)} new records from {table_name} (ID range: {min_id} to {max_id})")
 
         # Add CDC metadata
         df['cdc_operation'] = 'INSERT'  # Simplified: treating all as inserts
@@ -163,29 +178,34 @@ class CDCExtractor:
     def load_to_duckdb(self, df: pd.DataFrame, table_name: str, id_column: str):
         """Load CDC data to DuckDB"""
         if df.empty:
-            print(f"  No new records for {table_name}")
+            logger.debug(f"No new records to load for {table_name}")
             return
 
         # Insert into DuckDB CDC table
         target_table = f"raw.{table_name}_cdc"
 
-        # Use DuckDB's DataFrame INSERT
-        self.duck_conn.execute(f"INSERT INTO {target_table} SELECT * FROM df")
+        try:
+            # Use DuckDB's DataFrame INSERT
+            self.duck_conn.execute(f"INSERT INTO {target_table} SELECT * FROM df")
 
-        # Update metadata
-        max_id = df[id_column].max()
-        record_count = len(df)
+            # Update metadata
+            max_id = df[id_column].max()
+            record_count = len(df)
 
-        self.duck_conn.execute(f"""
-            UPDATE raw.cdc_metadata
-            SET
-                last_extracted_id = {max_id},
-                last_extracted_at = CURRENT_TIMESTAMP,
-                total_records_extracted = total_records_extracted + {record_count}
-            WHERE table_name = '{table_name}'
-        """)
+            self.duck_conn.execute(f"""
+                UPDATE raw.cdc_metadata
+                SET
+                    last_extracted_id = {max_id},
+                    last_extracted_at = CURRENT_TIMESTAMP,
+                    total_records_extracted = total_records_extracted + {record_count}
+                WHERE table_name = '{table_name}'
+            """)
 
-        print(f"✓ Loaded {record_count} records to {target_table} (max ID: {max_id})")
+            logger.info(f"Loaded {record_count} records to {target_table} (max ID: {max_id})")
+
+        except Exception as e:
+            logger.error(f"Error loading data to {target_table}: {e}", exc_info=True)
+            raise
 
     def export_to_parquet(self, table_name: str):
         """Export CDC data to Parquet format (Iceberg-compatible)"""
@@ -195,53 +215,83 @@ class CDCExtractor:
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         parquet_path = f"{output_dir}/{table_name}_cdc_{timestamp}.parquet"
 
-        self.duck_conn.execute(f"""
-            COPY (SELECT * FROM raw.{table_name}_cdc)
-            TO '{parquet_path}' (FORMAT PARQUET, COMPRESSION SNAPPY)
-        """)
+        try:
+            self.duck_conn.execute(f"""
+                COPY (SELECT * FROM raw.{table_name}_cdc)
+                TO '{parquet_path}' (FORMAT PARQUET, COMPRESSION SNAPPY)
+            """)
 
-        print(f"✓ Exported {table_name} to {parquet_path}")
+            logger.info(f"Exported {table_name} to {parquet_path}")
 
-    def run_extraction(self):
-        """Run full CDC extraction for all tables"""
+        except Exception as e:
+            logger.error(f"Error exporting {table_name} to Parquet: {e}", exc_info=True)
+            raise
+
+    def run_extraction(self) -> Dict[str, int]:
+        """Run full CDC extraction for all tables and return metrics"""
         tables = [
             ('customers', 'customer_id'),
             ('orders', 'order_id'),
             ('order_items', 'order_item_id')
         ]
 
-        print("\n=== Starting CDC Extraction ===")
+        logger.info("Starting CDC extraction for all tables")
+
+        metrics = {
+            'total_records_extracted': 0,
+            'tables_processed': 0,
+            'tables_with_changes': 0,
+            'errors': 0
+        }
 
         for table_name, id_column in tables:
-            print(f"\nExtracting {table_name}...")
+            logger.info(f"Extracting changes from {table_name}...")
             try:
-                df = self.extract_table_changes(table_name, id_column)
-                self.load_to_duckdb(df, table_name, id_column)
+                with LogContext(logger, f"Extract and load {table_name}"):
+                    df = self.extract_table_changes(table_name, id_column)
 
-                # Optionally export to Parquet for Iceberg
-                # self.export_to_parquet(table_name)
+                    if not df.empty:
+                        metrics['tables_with_changes'] += 1
+                        metrics['total_records_extracted'] += len(df)
+                        metrics[f'{table_name}_records'] = len(df)
+
+                    self.load_to_duckdb(df, table_name, id_column)
+
+                    # Optionally export to Parquet for Iceberg
+                    # self.export_to_parquet(table_name)
+
+                metrics['tables_processed'] += 1
 
             except Exception as e:
-                print(f"✗ Error extracting {table_name}: {e}")
+                logger.error(f"Error extracting {table_name}: {e}", exc_info=True)
+                metrics['errors'] += 1
 
         # Show extraction summary
         self.show_summary()
 
+        return metrics
+
     def show_summary(self):
         """Display CDC extraction summary"""
-        print("\n=== CDC Extraction Summary ===")
-        result = self.duck_conn.execute("""
-            SELECT
-                table_name,
-                last_extracted_id,
-                last_extracted_at,
-                total_records_extracted
-            FROM raw.cdc_metadata
-            ORDER BY table_name
-        """).fetchall()
+        logger.info("CDC Extraction Summary")
+        logger.info("-" * 60)
 
-        for row in result:
-            print(f"  {row[0]}: {row[3]} total records (last ID: {row[1]})")
+        try:
+            result = self.duck_conn.execute("""
+                SELECT
+                    table_name,
+                    last_extracted_id,
+                    last_extracted_at,
+                    total_records_extracted
+                FROM raw.cdc_metadata
+                ORDER BY table_name
+            """).fetchall()
+
+            for row in result:
+                logger.info(f"  {row[0]}: {row[3]} total records (last ID: {row[1]}, last extract: {row[2]})")
+
+        except Exception as e:
+            logger.error(f"Error displaying summary: {e}", exc_info=True)
 
     def close(self):
         """Close database connections"""
@@ -268,18 +318,16 @@ def main():
     extractor = CDCExtractor(postgres_config, duckdb_path)
 
     try:
-        print("Connecting to databases...")
+        logger.info("Starting CDC extraction process")
         extractor.connect()
-        print("✓ Connected to Postgres and DuckDB")
 
-        extractor.run_extraction()
+        metrics = extractor.run_extraction()
 
-        print("\n✓ CDC extraction completed successfully!")
+        logger.info("CDC extraction completed successfully!")
+        logger.info(f"Metrics: {metrics}")
 
     except Exception as e:
-        print(f"\n✗ Error: {e}")
-        import traceback
-        traceback.print_exc()
+        logger.critical(f"CDC extraction failed: {e}", exc_info=True)
     finally:
         extractor.close()
 
