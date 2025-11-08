@@ -1,0 +1,7 @@
+bookstore_exercise:
+  outputs:
+    dev:
+      type: duckdb
+      path: ../exercise_db/bookstore.duckdb
+      threads: 4
+  target: dev
